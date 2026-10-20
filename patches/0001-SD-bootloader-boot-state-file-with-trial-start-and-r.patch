@@ -1,0 +1,521 @@
+From 51f77c377b33a9bc807243ec027123fcb8d890a0 Mon Sep 17 00:00:00 2001
+From: oaradla <339301037+Oaradla@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 04:36:50 +0000
+Subject: [PATCH] SD bootloader: boot state file with trial start and rollback
+
+ngCfg.json "general.stateFile" names a small state file on the card
+(32 bytes, magic NGS1, CRC-32). A slot marked pending is started once
+as a trial; an unconfirmed start, a failed load or a watchdog reset
+falls back to the active slot and records the result, so a firmware
+update cannot leave the box without a working image. The file is
+rewritten in place through a direct sector write, FatFs stays
+read-only. Before the jump the bootloader leaves a handover record at
+0x20003FE0 for SD images that are not the original firmware.
+
+The SD card stays powered when an SD image is started: a short supply
+off phase left the card busy in ACMD41.
+---
+ sd-bootloader-ng/bootmanager/MakefileBase     |   1 +
+ sd-bootloader-ng/bootmanager/bootmgr.ld       |   3 +
+ sd-bootloader-ng/bootmanager/bootstate.c      | 133 ++++++++++++++++++
+ sd-bootloader-ng/bootmanager/bootstate.h      |  48 +++++++
+ sd-bootloader-ng/bootmanager/config.c         |   7 +-
+ sd-bootloader-ng/bootmanager/config.h         |   1 +
+ .../bootmanager/lib/FatFs/ffconf.h            |   6 +
+ sd-bootloader-ng/bootmanager/main.c           | 117 +++++++++++++--
+ 8 files changed, 301 insertions(+), 15 deletions(-)
+ create mode 100644 sd-bootloader-ng/bootmanager/bootstate.c
+ create mode 100644 sd-bootloader-ng/bootmanager/bootstate.h
+
+diff --git a/sd-bootloader-ng/bootmanager/MakefileBase b/sd-bootloader-ng/bootmanager/MakefileBase
+index 2f57a80..fe810a4 100755
+--- a/sd-bootloader-ng/bootmanager/MakefileBase
++++ b/sd-bootloader-ng/bootmanager/MakefileBase
+@@ -115,6 +115,7 @@ ${BINDIR}:
+ ${BINDIR}/bootmgr.axf: ${OBJDIR}/main.o
+ ${BINDIR}/bootmgr.axf: ${OBJDIR}/helper.o
+ ${BINDIR}/bootmgr.axf: ${OBJDIR}/config.o
++${BINDIR}/bootmgr.axf: ${OBJDIR}/bootstate.o
+ ${BINDIR}/bootmgr.axf: ${OBJDIR}/armAsm.o
+ ${BINDIR}/bootmgr.axf: ${OBJDIR}/patch.o
+ ${BINDIR}/bootmgr.axf: ${OBJDIR}/watchdog.o
+diff --git a/sd-bootloader-ng/bootmanager/bootmgr.ld b/sd-bootloader-ng/bootmanager/bootmgr.ld
+index f6b0fc2..d867a60 100755
+--- a/sd-bootloader-ng/bootmanager/bootmgr.ld
++++ b/sd-bootloader-ng/bootmanager/bootmgr.ld
+@@ -110,4 +110,7 @@ SECTIONS
+ 	_eheap = .;
+ 
+     } > SRAM2
++
++    /* The handover record lies at 0x20003FE0 (bootstate.c). */
++    ASSERT(_ebss <= 0x20003FE0, "bootloader data overlaps the handover record")
+ }
+diff --git a/sd-bootloader-ng/bootmanager/bootstate.c b/sd-bootloader-ng/bootmanager/bootstate.c
+new file mode 100644
+index 0000000..72dba42
+--- /dev/null
++++ b/sd-bootloader-ng/bootmanager/bootstate.c
+@@ -0,0 +1,133 @@
++//Boot state file and handover record, see bootstate.h.
++#include <string.h>
++#include "bootstate.h"
++#include "ff.h"
++#include "diskio.h"
++#include "logger.h"
++
++#define STATE_MAGIC 0x3153474Eu   //"NGS1"
++#define HANDOVER_MAGIC 0x3148474Eu //"NGH1"
++#define HANDOVER_ADDR 0x20003FE0u
++
++//CRC-32 as in Ogg: polynomial 0x04C11DB7, init 0, not reflected.
++static uint32_t crc32Ogg(const uint8_t* data, uint32_t len) {
++  uint32_t crc = 0;
++  while (len--) {
++    crc ^= (uint32_t)*data++ << 24;
++    for (uint8_t i = 0; i < 8; i++)
++      crc = (crc & 0x80000000u) ? (crc << 1) ^ 0x04C11DB7u : crc << 1;
++  }
++  return crc;
++}
++
++static uint32_t getLe32(const uint8_t* p) {
++  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static void putLe32(uint8_t* p, uint32_t v) {
++  p[0] = (uint8_t)v;
++  p[1] = (uint8_t)(v >> 8);
++  p[2] = (uint8_t)(v >> 16);
++  p[3] = (uint8_t)(v >> 24);
++}
++
++static bool slotValid(uint8_t slot) {
++  return slot <= 8 || slot == BOOTSTATE_SLOT_NONE;
++}
++
++bool BootState_Read(const char* path, sBootState* state) {
++  FIL file;
++  uint8_t raw[32];
++  UINT read = 0;
++
++  if (path == NULL || path[0] == '\0')
++    return false;
++  if (f_open(&file, path, FA_READ) != FR_OK)
++    return false;
++  bool ok = f_size(&file) == sizeof(raw) && f_read(&file, raw, sizeof(raw), &read) == FR_OK && read == sizeof(raw);
++  f_close(&file);
++  if (!ok)
++    return false;
++  if (getLe32(raw) != STATE_MAGIC || getLe32(raw + 28) != crc32Ogg(raw, 28)) {
++    Logger_error("Boot state file %s invalid", path);
++    return false;
++  }
++  state->activeSlot = raw[4];
++  state->nextSlot = raw[5];
++  state->nextKind = raw[6];
++  state->tries = raw[7];
++  state->helperTask = raw[8];
++  state->lastResult = raw[9];
++  state->helperSlot = raw[10];
++  state->rolledBackBuild = getLe32(raw + 12);
++  if (!slotValid(state->activeSlot) || !slotValid(state->nextSlot) || !slotValid(state->helperSlot)) {
++    Logger_error("Boot state file %s has an invalid slot", path);
++    return false;
++  }
++  return true;
++}
++
++bool BootState_Write(const char* path, const sBootState* state) {
++  FIL file;
++  uint8_t raw[32];
++  UINT read = 0;
++
++  //The file system is read-only here: the file, created by the firmware,
++  //is rewritten in place, its first sector written directly.
++  if (f_open(&file, path, FA_READ) != FR_OK)
++    return false;
++  bool ok = f_size(&file) == sizeof(raw) && f_read(&file, raw, sizeof(raw), &read) == FR_OK
++            && read == sizeof(raw) && file.sect != 0;
++  if (ok) {
++    FATFS* fs = file.obj.fs;
++    //With _FS_TINY the sector of the file data is in fs->win now.
++    ok = fs->winsect == file.sect;
++    if (ok) {
++      memset(fs->win, 0, 32);
++      putLe32(fs->win, STATE_MAGIC);
++      fs->win[4] = state->activeSlot;
++      fs->win[5] = state->nextSlot;
++      fs->win[6] = state->nextKind;
++      fs->win[7] = state->tries;
++      fs->win[8] = state->helperTask;
++      fs->win[9] = state->lastResult;
++      fs->win[10] = state->helperSlot;
++      putLe32(fs->win + 12, state->rolledBackBuild);
++      putLe32(fs->win + 28, crc32Ogg(fs->win, 28));
++      ok = disk_write(fs->drv, fs->win, file.sect, 1) == RES_OK;
++    }
++  }
++  f_close(&file);
++  if (!ok)
++    Logger_error("Writing boot state file %s failed", path);
++  return ok;
++}
++
++uint32_t BootState_ImageBuild(const char* imagePath) {
++  FIL file;
++  uint8_t bb[112];
++  UINT read = 0;
++  uint32_t build = 0;
++
++  if (f_open(&file, imagePath, FA_READ) != FR_OK)
++    return 0;
++  uint32_t size = f_size(&file);
++  if (size >= 176 && f_lseek(&file, size - 176) == FR_OK
++      && f_read(&file, bb, sizeof(bb), &read) == FR_OK && read == sizeof(bb)
++      && getLe32(bb) == 0xBEAC0005u && getLe32(bb + 108) == 0xBEAC0005u)
++    build = getLe32(bb + 8);
++  f_close(&file);
++  return build;
++}
++
++void BootState_WriteHandover(uint8_t slot, uint8_t kind, uint32_t bootloaderWord) {
++  uint8_t raw[32];
++
++  memset(raw, 0, sizeof(raw));
++  putLe32(raw, HANDOVER_MAGIC);
++  raw[4] = slot;
++  raw[5] = kind;
++  putLe32(raw + 8, bootloaderWord);
++  putLe32(raw + 28, crc32Ogg(raw, 28));
++  memcpy((void*)HANDOVER_ADDR, raw, sizeof(raw));
++}
+diff --git a/sd-bootloader-ng/bootmanager/bootstate.h b/sd-bootloader-ng/bootmanager/bootstate.h
+new file mode 100644
+index 0000000..b827e2c
+--- /dev/null
++++ b/sd-bootloader-ng/bootmanager/bootstate.h
+@@ -0,0 +1,48 @@
++//Boot state file and handover record for trial starts, rollback and helper
++//images.
++#ifndef __BOOTSTATE_H__
++#define __BOOTSTATE_H__
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define BOOTSTATE_SLOT_NONE 0xFF
++
++enum BOOTSTATE_KIND {
++  BOOTSTATE_KIND_NONE = 0,
++  BOOTSTATE_KIND_TRIAL = 1,
++  BOOTSTATE_KIND_HELPER = 2,
++};
++
++enum BOOTSTATE_RESULT {
++  BOOTSTATE_RESULT_NONE = 0,
++  BOOTSTATE_RESULT_CONFIRMED = 1,
++  BOOTSTATE_RESULT_ROLLED_BACK = 2,
++  BOOTSTATE_RESULT_HELPER_DONE = 3,
++  BOOTSTATE_RESULT_HELPER_FAILED = 4,
++};
++
++typedef struct sBootState {
++  uint8_t activeSlot;
++  uint8_t nextSlot;
++  uint8_t nextKind;
++  uint8_t tries;
++  uint8_t helperTask;
++  uint8_t lastResult;
++  uint8_t helperSlot;
++  uint32_t rolledBackBuild;
++} sBootState;
++
++//Reads the state file named by "stateFile"; false when it is missing or
++//invalid.
++bool BootState_Read(const char* path, sBootState* state);
++bool BootState_Write(const char* path, const sBootState* state);
++
++//Build number (offset 8 of the build block) of a slot file; 0 if unreadable.
++uint32_t BootState_ImageBuild(const char* imagePath);
++
++//Writes the handover record at 0x20003FE0. Must be the last
++//memory write before the jump.
++void BootState_WriteHandover(uint8_t slot, uint8_t kind, uint32_t bootloaderWord);
++
++#endif
+diff --git a/sd-bootloader-ng/bootmanager/config.c b/sd-bootloader-ng/bootmanager/config.c
+index 62801e4..d2400a4 100644
+--- a/sd-bootloader-ng/bootmanager/config.c
++++ b/sd-bootloader-ng/bootmanager/config.c
+@@ -16,7 +16,8 @@ sGeneralSettings Config_generalSettings = {
+   true,  //serialLog
+   #endif
+   DEBUG_LOG_LEVEL,
+-  false //logColor
++  false, //logColor
++  "\0"   //stateFile
+ };
+ sImageInfo Config_imageInfos[IMG_MAX_COUNT];
+ 
+@@ -119,6 +120,10 @@ static void jsmn_str(const char *value, size_t len, void *user_arg) {
+         uint8_t cpyLen = min(len, CONFIG_FLASH_PATH_MAX-1);
+         strncpy(Config_generalSettings.ofwFixFlash, value, cpyLen);
+         Config_generalSettings.ofwFixFlash[cpyLen] = '\0';
++      } else if (strcmp("stateFile", jsonValueName) == 0) {
++        uint8_t cpyLen = min(len, CONFIG_FLASH_PATH_MAX-1);
++        strncpy(Config_generalSettings.stateFile, value, cpyLen);
++        Config_generalSettings.stateFile[cpyLen] = '\0';
+       }
+     } else if (strncmp(jsonGroupName, "ofw", 3) == 0
+       || strncmp(jsonGroupName, "cfw", 3)
+diff --git a/sd-bootloader-ng/bootmanager/config.h b/sd-bootloader-ng/bootmanager/config.h
+index cbe47e4..f120155 100644
+--- a/sd-bootloader-ng/bootmanager/config.h
++++ b/sd-bootloader-ng/bootmanager/config.h
+@@ -29,6 +29,7 @@ typedef struct sGeneralSettings
+   bool serialLog;
+   uint8_t logLevel;
+   bool logColor;
++  char stateFile[CONFIG_FLASH_PATH_MAX];
+ 
+ } sGeneralSettings;
+ typedef struct sImageInfo
+diff --git a/sd-bootloader-ng/bootmanager/lib/FatFs/ffconf.h b/sd-bootloader-ng/bootmanager/lib/FatFs/ffconf.h
+index 263463a..32085a3 100644
+--- a/sd-bootloader-ng/bootmanager/lib/FatFs/ffconf.h
++++ b/sd-bootloader-ng/bootmanager/lib/FatFs/ffconf.h
+@@ -15,7 +15,13 @@
+ /  and optional writing functions as well. */
+ 
+ 
++/* The SD bootloader needs f_lseek() for the build block of a slot file;
++/  the preloader does not. */
++#ifdef FIXED_BOOT_IMAGE
+ #define _FS_MINIMIZE	3
++#else
++#define _FS_MINIMIZE	2
++#endif
+ /* This option defines minimization level to remove some basic API functions.
+ /
+ /   0: All basic functions are enabled.
+diff --git a/sd-bootloader-ng/bootmanager/main.c b/sd-bootloader-ng/bootmanager/main.c
+index f86d5a5..3e6a35f 100755
+--- a/sd-bootloader-ng/bootmanager/main.c
++++ b/sd-bootloader-ng/bootmanager/main.c
+@@ -77,6 +77,7 @@
+ 
+ #include "ff.h"
+ #include "diskio.h"
++#include "bootstate.h"
+ 
+ static FATFS fatfs;
+ 
+@@ -97,6 +98,16 @@ static char imagePath[] = IMG_SD_PATH;
+ static char flashPath[] = OFW_IMAGE_PATH;
+ static bool slInitialized = false;
+ static sBootInfoCust bootInfoData = { FW_SLOT_INVALID, FW_STATE_INVALID };
++#ifndef FIXED_BOOT_IMAGE
++//Trial start, rollback and helper runs.
++static bool bootStateValid = false;
++static sBootState bootState;
++static uint8_t bootKind = BOOTSTATE_KIND_NONE;
++//Left 0: the firmware reads the word from the flash itself.
++static uint32_t bootloaderWord = 0;
++static uint8_t jsonActiveImage = 0;
++static bool FailedNextSlot(void);
++#endif
+ //*****************************************************************************
+ // Vector Table
+ extern void (*const g_pfnVectors[])(void);
+@@ -337,13 +348,15 @@ static void SimpleLinkDeinit() {
+ }
+ 
+ 
+-static void BoardDeinitCustom(void)
++static void BoardDeinitCustom(bool keepSdPower)
+ {
+   Logger_debug("Prepare board deinitialization...");
+   SimpleLinkDeinit();
+   watchdog_feed();
+-  //Power off SD
+-  MAP_GPIOPinWrite(POWER_SD_PORT, POWER_SD_PORT_MASK, POWER_SD_PORT_MASK); //SIC! 
++  //Power off SD; an SD image keeps the card powered, since a short off phase
++  //leaves the card stuck busy (the image resets it with CMD0)
++  if (!keepSdPower)
++    MAP_GPIOPinWrite(POWER_SD_PORT, POWER_SD_PORT_MASK, POWER_SD_PORT_MASK); //SIC! 
+   //Power off other peripherals
+   MAP_GPIOPinWrite(POWER_PORT, POWER_PORT_MASK, 0x00);
+ 
+@@ -468,12 +481,19 @@ static uint16_t getBatteryLevel()
+ static void hibernate() {
+   Logger_info("Prepare hibernation");
+   watchdog_stop();
+-  BoardDeinitCustom();
++  BoardDeinitCustom(false);
+   
+   PRCMHibernateWakeupSourceEnable(PRCM_HIB_GPIO2 | PRCM_HIB_GPIO4); //enable ear wakeup interrupt
+   PRCMHibernateEnter();
+ }
+ 
++static void wdtResetHibernate() {
++  prebootmgr_blink_error(5, 33);
++  prebootmgr_blink_error(5, 66);
++  prebootmgr_blink_error(5, 33);
++  hibernate();
++}
++
+ static uint16_t checkBattery() {
+   #ifndef FIXED_BOOT_IMAGE
+   uint16_t batteryLevel = getBatteryLevel();
+@@ -573,6 +593,59 @@ static uint8_t Selector(uint8_t startNumber) {
+   }
+   return counter;
+ }
++#ifndef FIXED_BOOT_IMAGE
++//Chooses the slot to start from the boot state file. Returns
++//true when a trial start or helper run was pending.
++static bool ApplyBootState(void) {
++  bool pending = false;
++
++  bootKind = BOOTSTATE_KIND_NONE;
++  jsonActiveImage = Config_generalSettings.activeImage;
++  bootStateValid = BootState_Read(Config_generalSettings.stateFile, &bootState);
++  if (!bootStateValid)
++    return false;
++
++  if (bootState.activeSlot != BOOTSTATE_SLOT_NONE)
++    Config_generalSettings.activeImage = bootState.activeSlot;
++
++  if (bootState.nextSlot != BOOTSTATE_SLOT_NONE) {
++    pending = true;
++    if (bootState.tries == 0 && Config_imageInfos[bootState.nextSlot].fileExists) {
++      bootState.tries = 1;
++      if (BootState_Write(Config_generalSettings.stateFile, &bootState)) {
++        Logger_info("Trial/helper start of slot %i, kind %i", bootState.nextSlot, bootState.nextKind);
++        Config_generalSettings.activeImage = bootState.nextSlot;
++        bootKind = bootState.nextKind;
++      }
++    } else {
++      FailedNextSlot();
++    }
++  }
++  return pending;
++}
++
++//The pending slot did not confirm or could not be started: return to the
++//active slot. Returns false when nothing was pending.
++static bool FailedNextSlot(void) {
++  if (!bootStateValid || bootState.nextSlot == BOOTSTATE_SLOT_NONE)
++    return false;
++  Logger_warn("Slot %i not confirmed, back to the active slot", bootState.nextSlot);
++  if (bootState.nextKind == BOOTSTATE_KIND_TRIAL) {
++    bootState.lastResult = BOOTSTATE_RESULT_ROLLED_BACK;
++    bootState.rolledBackBuild = BootState_ImageBuild(GetImagePathById(bootState.nextSlot));
++  } else {
++    bootState.lastResult = BOOTSTATE_RESULT_HELPER_FAILED;
++  }
++  bootState.nextSlot = BOOTSTATE_SLOT_NONE;
++  bootState.nextKind = BOOTSTATE_KIND_NONE;
++  bootState.tries = 0;
++  BootState_Write(Config_generalSettings.stateFile, &bootState);
++  bootKind = BOOTSTATE_KIND_NONE;
++  Config_generalSettings.activeImage = bootState.activeSlot != BOOTSTATE_SLOT_NONE ? bootState.activeSlot : jsonActiveImage;
++  return true;
++}
++#endif
++
+ static bool prepareRun(sImageInfo* imageInfo, char* imagePath, uint32_t filesize) {
+   FIL ffile;
+   uint8_t ffs_result;
+@@ -735,7 +808,11 @@ static bool prepareRun(sImageInfo* imageInfo, char* imagePath, uint32_t filesize
+   WaitForEarpress(Config_generalSettings.waitForBoot);
+   #endif
+   checkBattery();
+-  BoardDeinitCustom();
++  #ifndef FIXED_BOOT_IMAGE
++  BoardDeinitCustom(!imageInfo->ofwSimBL && !imageInfo->bootFlashImg && !imageInfo->ofwFix);
++  #else
++  BoardDeinitCustom(false);
++  #endif
+ 
+   #ifdef FIXED_BOOT_IMAGE
+     watchdog_start_slow();
+@@ -758,6 +835,8 @@ static bool prepareRun(sImageInfo* imageInfo, char* imagePath, uint32_t filesize
+     Logger_info("Start firmware sd:%s ...", imagePath);
+   #ifndef FIXED_BOOT_IMAGE
+   }
++  if (!imageInfo->ofwSimBL && !imageInfo->bootFlashImg && !imageInfo->ofwFix)
++    BootState_WriteHandover(Config_generalSettings.activeImage, bootKind, bootloaderWord);
+   #endif
+ 
+   Run((unsigned long)pImgRun);
+@@ -776,15 +855,16 @@ int main()
+ 
+   Logger_info(BUILD_FULL_NAME);
+   uint32_t sysResetCause = MAP_PRCMSysResetCauseGet();
+-  if (sysResetCause == PRCM_WDT_RESET) {
++  bool wdtReset = (sysResetCause == PRCM_WDT_RESET);
++  if (wdtReset) {
+     Logger_warn("Wakeup by WDT_Reset");
+     watchdog_recovery_sequence();
+-
+-    prebootmgr_blink_error(5, 33);
+-    prebootmgr_blink_error(5, 66);
+-    prebootmgr_blink_error(5, 33);
+-
+-    hibernate();
++    #ifdef FIXED_BOOT_IMAGE
++    wdtResetHibernate();
++    #endif
++    //The SD bootloader decides after mounting the card: a watchdog reset
++    //during a trial start or helper run falls back to the active slot
++    //instead of hibernating.
+   } else {
+     Logger_info("Wakeup by cause %i", sysResetCause);
+   }
+@@ -803,6 +883,8 @@ int main()
+     #else
+     Config_ReadJsonCfg();
+     if (CheckSdImages()) {
++      if (!ApplyBootState() && wdtReset)
++        wdtResetHibernate();
+       uint16_t batteryLevel = checkBattery();
+       Logger_debug("Battery level is %i, poweroff at %i", batteryLevel, Config_generalSettings.minBatteryLevel);
+ 
+@@ -859,8 +941,11 @@ int main()
+               #ifdef FIXED_BOOT_IMAGE
+                 prepareRun(NULL, image, filesize);
+               #else
+-                if (!prepareRun(&Config_imageInfos[selectedImgNum], image, filesize))
++                if (!prepareRun(&Config_imageInfos[selectedImgNum], image, filesize)) {
++                  if (FailedNextSlot())
++                    Config_generalSettings.waitForPress = false;
+                   goto retrySelection;
++                }
+               #endif
+             } else {
+                 Logger_error("Reading file failed error=%i", ffs_result);
+@@ -871,6 +956,10 @@ int main()
+             }
+         } else {
+             Logger_error("Opening file failed error=%i", ffs_result);
++            #ifndef FIXED_BOOT_IMAGE
++            if (FailedNextSlot())
++              goto retrySelection;
++            #endif
+             UtilsDelayMsWD(1000);
+             prebootmgr_blink_error(3, 500);
+             UtilsDelayMsWD(2000);
+@@ -897,7 +986,7 @@ int main()
+       if (!sl_FsGetInfo(FALLBACK_IMG_FLASH_PATH, 0, &pFsFileInfo)) {
+           if (pFsFileInfo.FileLen == sl_FsRead(fhandle, 0, (unsigned char *)APP_IMG_SRAM_OFFSET, pFsFileInfo.FileLen)) {
+               sl_FsClose(fhandle, 0, 0, 0);
+-              BoardDeinitCustom();
++              BoardDeinitCustom(false);
+               Logger_info("Start fallback firmware flash:%s ...", FALLBACK_IMG_FLASH_PATH);
+               Run(APP_IMG_SRAM_OFFSET);
+           }
+-- 
+2.47.3
+
