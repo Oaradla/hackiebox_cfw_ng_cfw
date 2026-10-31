@@ -1,29 +1,41 @@
-From 51f77c377b33a9bc807243ec027123fcb8d890a0 Mon Sep 17 00:00:00 2001
+From 53bac01bfbb1fa746e22ffa742911cc07b16d352 Mon Sep 17 00:00:00 2001
 From: oaradla <339301037+Oaradla@users.noreply.github.com>
-Date: Tue, 20 Oct 2026 04:36:50 +0000
+Date: Sat, 31 Oct 2026 10:58:18 +0000
 Subject: [PATCH] SD bootloader: boot state file with trial start and rollback
 
 ngCfg.json "general.stateFile" names a small state file on the card
 (32 bytes, magic NGS1, CRC-32). A slot marked pending is started once
 as a trial; an unconfirmed start, a failed load or a watchdog reset
 falls back to the active slot and records the result, so a firmware
-update cannot leave the box without a working image. The file is
+update cannot leave the box without a working image. A trial counts
+only right before the jump, and a pending image that cannot be read
+falls back in the same start. A slot picked by hand with the ears
+starts normally and leaves the pending trial as it is. The file is
 rewritten in place through a direct sector write, FatFs stays
 read-only. Before the jump the bootloader leaves a handover record at
-0x20003FE0 for SD images that are not the original firmware.
+0x20003FE0 for SD images that are not the original firmware; both
+linker scripts check that the bootloader's data stays below it.
 
 The SD card stays powered when an SD image is started: a short supply
 off phase left the card busy in ACMD41.
+
+An empty battery broke down under the start load and restarted the box
+in a loop: the battery is checked before the peripheral supply comes on
+and again 20 ms after peripherals and SD card are on (the level is
+logged in the debug build), and the network processor is started only
+for a slot that needs the bootinfo. The preloader in the flash is
+unchanged.
 ---
  sd-bootloader-ng/bootmanager/MakefileBase     |   1 +
+ sd-bootloader-ng/bootmanager/bootmgr.debug.ld |   3 +
  sd-bootloader-ng/bootmanager/bootmgr.ld       |   3 +
- sd-bootloader-ng/bootmanager/bootstate.c      | 133 ++++++++++++++++++
- sd-bootloader-ng/bootmanager/bootstate.h      |  48 +++++++
+ sd-bootloader-ng/bootmanager/bootstate.c      | 133 ++++++++++++++
+ sd-bootloader-ng/bootmanager/bootstate.h      |  48 +++++
  sd-bootloader-ng/bootmanager/config.c         |   7 +-
  sd-bootloader-ng/bootmanager/config.h         |   1 +
  .../bootmanager/lib/FatFs/ffconf.h            |   6 +
- sd-bootloader-ng/bootmanager/main.c           | 117 +++++++++++++--
- 8 files changed, 301 insertions(+), 15 deletions(-)
+ sd-bootloader-ng/bootmanager/main.c           | 169 ++++++++++++++++--
+ 9 files changed, 351 insertions(+), 20 deletions(-)
  create mode 100644 sd-bootloader-ng/bootmanager/bootstate.c
  create mode 100644 sd-bootloader-ng/bootmanager/bootstate.h
 
@@ -39,6 +51,18 @@ index 2f57a80..fe810a4 100755
  ${BINDIR}/bootmgr.axf: ${OBJDIR}/armAsm.o
  ${BINDIR}/bootmgr.axf: ${OBJDIR}/patch.o
  ${BINDIR}/bootmgr.axf: ${OBJDIR}/watchdog.o
+diff --git a/sd-bootloader-ng/bootmanager/bootmgr.debug.ld b/sd-bootloader-ng/bootmanager/bootmgr.debug.ld
+index 843f0c2..0e719a0 100755
+--- a/sd-bootloader-ng/bootmanager/bootmgr.debug.ld
++++ b/sd-bootloader-ng/bootmanager/bootmgr.debug.ld
+@@ -112,4 +112,7 @@ SECTIONS
+ 	_eheap = .;
+ 
+     } > SRAM2
++
++    /* The handover record lies at 0x20003FE0 (bootstate.c). */
++    ASSERT(_ebss <= 0x20003FE0, "bootloader data overlaps the handover record")
+ }
 diff --git a/sd-bootloader-ng/bootmanager/bootmgr.ld b/sd-bootloader-ng/bootmanager/bootmgr.ld
 index f6b0fc2..d867a60 100755
 --- a/sd-bootloader-ng/bootmanager/bootmgr.ld
@@ -300,7 +324,7 @@ index 263463a..32085a3 100644
  /
  /   0: All basic functions are enabled.
 diff --git a/sd-bootloader-ng/bootmanager/main.c b/sd-bootloader-ng/bootmanager/main.c
-index f86d5a5..3e6a35f 100755
+index f86d5a5..d6f8f4c 100755
 --- a/sd-bootloader-ng/bootmanager/main.c
 +++ b/sd-bootloader-ng/bootmanager/main.c
 @@ -77,6 +77,7 @@
@@ -311,7 +335,7 @@ index f86d5a5..3e6a35f 100755
  
  static FATFS fatfs;
  
-@@ -97,6 +98,16 @@ static char imagePath[] = IMG_SD_PATH;
+@@ -97,6 +98,19 @@ static char imagePath[] = IMG_SD_PATH;
  static char flashPath[] = OFW_IMAGE_PATH;
  static bool slInitialized = false;
  static sBootInfoCust bootInfoData = { FW_SLOT_INVALID, FW_STATE_INVALID };
@@ -320,15 +344,46 @@ index f86d5a5..3e6a35f 100755
 +static bool bootStateValid = false;
 +static sBootState bootState;
 +static uint8_t bootKind = BOOTSTATE_KIND_NONE;
++//Another slot was picked by hand: the pending slot waits for the next start.
++static bool nextSlotDeferred = false;
 +//Left 0: the firmware reads the word from the flash itself.
 +static uint32_t bootloaderWord = 0;
 +static uint8_t jsonActiveImage = 0;
 +static bool FailedNextSlot(void);
 +#endif
++static uint16_t checkBattery();
  //*****************************************************************************
  // Vector Table
  extern void (*const g_pfnVectors[])(void);
-@@ -337,13 +348,15 @@ static void SimpleLinkDeinit() {
+@@ -306,6 +320,13 @@ static void BoardInitCustom(void)
+   MAP_PinTypeGPIO(CHARGER_PIN_NUM, PIN_MODE_0, false);
+   MAP_GPIODirModeSet(CHARGER_PORT, CHARGER_PORT_MASK, GPIO_DIR_MODE_IN);
+ 
++  Logger_init();
++  #ifndef FIXED_BOOT_IMAGE
++  //An empty battery breaks down under the load of the peripherals and restarts the box
++  //in a loop: check it before they are powered, and again under their load
++  checkBattery();
++  #endif
++
+   //Power other peripherals
+   MAP_PinTypeGPIO(POWER_PIN_NUM, PIN_MODE_0, false);
+   MAP_GPIODirModeSet(POWER_PORT, POWER_PORT_MASK, GPIO_DIR_MODE_OUT);
+@@ -315,9 +336,11 @@ static void BoardInitCustom(void)
+   MAP_PRCMPeripheralClkEnable(PRCM_DTHE, PRCM_RUN_MODE_CLK | PRCM_SLP_MODE_CLK);
+   MAP_PRCMPeripheralReset(PRCM_DTHE);
+ 
+-  Logger_init();
+-
+   SdInit();
++  #ifndef FIXED_BOOT_IMAGE
++  UtilsDelayMs(20);
++  checkBattery();
++  #endif
+ }
+ 
+ static void SimpleLinkInit() {
+@@ -337,13 +360,15 @@ static void SimpleLinkDeinit() {
  }
  
  
@@ -347,7 +402,16 @@ index f86d5a5..3e6a35f 100755
    //Power off other peripherals
    MAP_GPIOPinWrite(POWER_PORT, POWER_PORT_MASK, 0x00);
  
-@@ -468,12 +481,19 @@ static uint16_t getBatteryLevel()
+@@ -424,7 +449,7 @@ static bool CheckSdImages() {
+   bool hasValidImage = false;
+   for (uint8_t i=0; i<IMG_MAX_COUNT; i++) {
+     if (Config_imageInfos[i].ofwSimBL) {
+-      Config_imageInfos[i].fileExists = ReadBootInfo();
++      Config_imageInfos[i].fileExists = true; //read when the slot is started, see main
+     } else if (Config_imageInfos[i].bootFlashImg) {
+       SimpleLinkInit();
+       Config_imageInfos[i].fileExists = FlashFileExists(Config_imageInfos[i].flashImg);
+@@ -468,23 +493,36 @@ static uint16_t getBatteryLevel()
  static void hibernate() {
    Logger_info("Prepare hibernation");
    watchdog_stop();
@@ -368,7 +432,26 @@ index f86d5a5..3e6a35f 100755
  static uint16_t checkBattery() {
    #ifndef FIXED_BOOT_IMAGE
    uint16_t batteryLevel = getBatteryLevel();
-@@ -573,6 +593,59 @@ static uint8_t Selector(uint8_t startNumber) {
+-  
++  Logger_debug("Battery level %i, charger %i", batteryLevel, isChargerConnected());
++
+   if (!isChargerConnected() && batteryLevel < Config_generalSettings.minBatteryLevel) {
+     Logger_debug("Battery low, goto hibernation...");
+     prebootmgr_blink_error(2, 66);
+     prebootmgr_blink_error(2, 133);
+     prebootmgr_blink_error(2, 66);
+ 
+-    hibernate();
++    //wake up by an ear or when the charger is connected
++    watchdog_stop();
++    BoardDeinitCustom(false);
++    PRCMHibernateWakeUpGPIOSelect(PRCM_HIB_GPIO17, PRCM_HIB_RISE_EDGE);
++    PRCMHibernateWakeupSourceEnable(PRCM_HIB_GPIO2 | PRCM_HIB_GPIO4 | PRCM_HIB_GPIO17);
++    PRCMHibernateEnter();
+   }
+   return batteryLevel;
+   #endif
+@@ -573,6 +611,65 @@ static uint8_t Selector(uint8_t startNumber) {
    }
    return counter;
  }
@@ -390,12 +473,8 @@ index f86d5a5..3e6a35f 100755
 +  if (bootState.nextSlot != BOOTSTATE_SLOT_NONE) {
 +    pending = true;
 +    if (bootState.tries == 0 && Config_imageInfos[bootState.nextSlot].fileExists) {
-+      bootState.tries = 1;
-+      if (BootState_Write(Config_generalSettings.stateFile, &bootState)) {
-+        Logger_info("Trial/helper start of slot %i, kind %i", bootState.nextSlot, bootState.nextKind);
-+        Config_generalSettings.activeImage = bootState.nextSlot;
-+        bootKind = bootState.nextKind;
-+      }
++      Config_generalSettings.activeImage = bootState.nextSlot;
++      bootKind = bootState.nextKind;
 +    } else {
 +      FailedNextSlot();
 +    }
@@ -403,10 +482,20 @@ index f86d5a5..3e6a35f 100755
 +  return pending;
 +}
 +
++//Counts the start of the pending slot. Called after the last check that can
++//hibernate, so a start that never happened is not used up.
++static bool CountNextSlotTry(void) {
++  bootState.tries = 1;
++  if (!BootState_Write(Config_generalSettings.stateFile, &bootState))
++    return false;
++  Logger_info("Trial/helper start of slot %i, kind %i", bootState.nextSlot, bootState.nextKind);
++  return true;
++}
++
 +//The pending slot did not confirm or could not be started: return to the
 +//active slot. Returns false when nothing was pending.
 +static bool FailedNextSlot(void) {
-+  if (!bootStateValid || bootState.nextSlot == BOOTSTATE_SLOT_NONE)
++  if (!bootStateValid || nextSlotDeferred || bootState.nextSlot == BOOTSTATE_SLOT_NONE)
 +    return false;
 +  Logger_warn("Slot %i not confirmed, back to the active slot", bootState.nextSlot);
 +  if (bootState.nextKind == BOOTSTATE_KIND_TRIAL) {
@@ -428,12 +517,14 @@ index f86d5a5..3e6a35f 100755
  static bool prepareRun(sImageInfo* imageInfo, char* imagePath, uint32_t filesize) {
    FIL ffile;
    uint8_t ffs_result;
-@@ -735,7 +808,11 @@ static bool prepareRun(sImageInfo* imageInfo, char* imagePath, uint32_t filesize
+@@ -735,7 +832,13 @@ static bool prepareRun(sImageInfo* imageInfo, char* imagePath, uint32_t filesize
    WaitForEarpress(Config_generalSettings.waitForBoot);
    #endif
    checkBattery();
 -  BoardDeinitCustom();
 +  #ifndef FIXED_BOOT_IMAGE
++  if (bootKind != BOOTSTATE_KIND_NONE && !CountNextSlotTry())
++    return false;
 +  BoardDeinitCustom(!imageInfo->ofwSimBL && !imageInfo->bootFlashImg && !imageInfo->ofwFix);
 +  #else
 +  BoardDeinitCustom(false);
@@ -441,7 +532,7 @@ index f86d5a5..3e6a35f 100755
  
    #ifdef FIXED_BOOT_IMAGE
      watchdog_start_slow();
-@@ -758,6 +835,8 @@ static bool prepareRun(sImageInfo* imageInfo, char* imagePath, uint32_t filesize
+@@ -758,6 +861,8 @@ static bool prepareRun(sImageInfo* imageInfo, char* imagePath, uint32_t filesize
      Logger_info("Start firmware sd:%s ...", imagePath);
    #ifndef FIXED_BOOT_IMAGE
    }
@@ -450,7 +541,7 @@ index f86d5a5..3e6a35f 100755
    #endif
  
    Run((unsigned long)pImgRun);
-@@ -776,15 +855,16 @@ int main()
+@@ -776,15 +881,16 @@ int main()
  
    Logger_info(BUILD_FULL_NAME);
    uint32_t sysResetCause = MAP_PRCMSysResetCauseGet();
@@ -474,7 +565,7 @@ index f86d5a5..3e6a35f 100755
    } else {
      Logger_info("Wakeup by cause %i", sysResetCause);
    }
-@@ -803,6 +883,8 @@ int main()
+@@ -803,15 +909,28 @@ int main()
      #else
      Config_ReadJsonCfg();
      if (CheckSdImages()) {
@@ -483,7 +574,27 @@ index f86d5a5..3e6a35f 100755
        uint16_t batteryLevel = checkBattery();
        Logger_debug("Battery level is %i, poweroff at %i", batteryLevel, Config_generalSettings.minBatteryLevel);
  
-@@ -859,8 +941,11 @@ int main()
+       retrySelection:
+         Config_generalSettings.activeImage = Selector(Config_generalSettings.activeImage);
++      if (bootKind != BOOTSTATE_KIND_NONE && Config_generalSettings.activeImage != bootState.nextSlot) {
++        Logger_info("Slot %i picked by hand, slot %i stays pending", Config_generalSettings.activeImage, bootState.nextSlot);
++        bootKind = BOOTSTATE_KIND_NONE;
++        nextSlotDeferred = true;
++      }
+         
+       uint8_t selectedImgNum = Config_generalSettings.activeImage;
+       char* image = GetImagePathById(selectedImgNum);
+ 
++      //The network processor starts only for a slot that needs the bootinfo: its start is the
++      //largest load of the whole start, which an old, empty battery does not survive
++      if (Config_imageInfos[selectedImgNum].ofwSimBL && !ReadBootInfo()) {
++        Config_imageInfos[selectedImgNum].fileExists = false;
++        goto retrySelection;
++      }
+       if (Config_imageInfos[selectedImgNum].ofwSimBL || Config_imageInfos[selectedImgNum].bootFlashImg) {
+         char* flashImage;
+         if (Config_imageInfos[selectedImgNum].ofwSimBL) {
+@@ -859,11 +978,19 @@ int main()
                #ifdef FIXED_BOOT_IMAGE
                  prepareRun(NULL, image, filesize);
                #else
@@ -496,7 +607,15 @@ index f86d5a5..3e6a35f 100755
                #endif
              } else {
                  Logger_error("Reading file failed error=%i", ffs_result);
-@@ -871,6 +956,10 @@ int main()
++                #ifndef FIXED_BOOT_IMAGE
++                f_close(&ffile);
++                if (FailedNextSlot())
++                  goto retrySelection;
++                #endif
+                 UtilsDelayMsWD(1000);
+                 prebootmgr_blink_error(4, 500);
+                 UtilsDelayMsWD(2000);
+@@ -871,6 +998,10 @@ int main()
              }
          } else {
              Logger_error("Opening file failed error=%i", ffs_result);
@@ -507,7 +626,7 @@ index f86d5a5..3e6a35f 100755
              UtilsDelayMsWD(1000);
              prebootmgr_blink_error(3, 500);
              UtilsDelayMsWD(2000);
-@@ -897,7 +986,7 @@ int main()
+@@ -897,7 +1028,7 @@ int main()
        if (!sl_FsGetInfo(FALLBACK_IMG_FLASH_PATH, 0, &pFsFileInfo)) {
            if (pFsFileInfo.FileLen == sl_FsRead(fhandle, 0, (unsigned char *)APP_IMG_SRAM_OFFSET, pFsFileInfo.FileLen)) {
                sl_FsClose(fhandle, 0, 0, 0);

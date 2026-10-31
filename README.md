@@ -23,6 +23,10 @@ the patch and builds.
 - Before the jump the bootloader leaves a small handover record at
   `0x20003FE0` for SD images that are not the original firmware.
 - The SD card stays powered when an SD image is started.
+- **Battery check at start.** The battery is checked before the peripherals
+  are powered and again once they and the SD card are on, and the network
+  processor is started only for a slot that needs it, so an empty battery no
+  longer restarts the box in a loop. The preloader is unchanged.
 
 Without a `stateFile` entry the bootloader behaves exactly as HackieboxNG.
 

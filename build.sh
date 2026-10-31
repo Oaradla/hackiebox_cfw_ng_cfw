@@ -16,7 +16,7 @@ fi
 cd work
 if ! git rev-parse -q --verify cfw-trial-boot >/dev/null; then
     git checkout -q -b cfw-trial-boot "$BASE"
-    git -c user.name=build -c user.email=build@localhost am -q ../patches/*.patch
+    git -c user.name=build -c user.email=build@localhost am -q --keep-cr ../patches/*.patch
 else
     git checkout -q cfw-trial-boot
 fi
