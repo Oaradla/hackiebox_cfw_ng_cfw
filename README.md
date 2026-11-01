@@ -26,7 +26,14 @@ the patch and builds.
 - **Battery check at start.** The battery is checked before the peripherals
   are powered and again once they and the SD card are on, and the network
   processor is started only for a slot that needs it, so an empty battery no
-  longer restarts the box in a loop. The preloader is unchanged.
+  longer restarts the box in a loop. If the custom firmware's last start
+  broke down in its network processor start, a pending trial is given back
+  without counting the try, and the box blinks five times slowly and
+  hibernates until an ear or the charger wakes it.
+- An SD image that would not fit below the bootloader or is shorter than its
+  hash is not loaded.
+- The preloader in the flash is unchanged; the firmware package takes it from
+  the HackieboxNG release v0.9.3d.
 
 Without a `stateFile` entry the bootloader behaves exactly as HackieboxNG.
 
@@ -36,8 +43,8 @@ Without a `stateFile` entry the bootloader behaves exactly as HackieboxNG.
 ./build.sh          # clones HackieboxNG into work/, applies patches/, builds
 ```
 
-The result is in `work/exe/sd-bootloader-ng/` (`sd/revvox/boot/ngbootloader.bin`
-and the preloader `flash/sys/mcuimg.bin`) and as a zip next to it. The
+The result is in `work/exe/sd-bootloader-ng/` (`sd/revvox/boot/ngbootloader.bin`)
+and as a zip next to it. The
 custom firmware's release script takes it with
 `BOOTLOADER=$PWD/work tools/release.sh VERSION`. The toolchain and the TI
 CC3200 SDK come with HackieboxNG.
